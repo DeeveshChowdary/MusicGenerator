@@ -212,7 +212,7 @@ export const DEFAULT_CONTROLS: GeneratorControls = {
   loopBars: 4,
   masterVolume: 0.85,
   arrangementMinutes: 2,
-  exportBars: 8,
+  exportBars: 12,
 };
 
 export function getMoodPreset(moodId: string): MoodPreset {

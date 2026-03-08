@@ -29,6 +29,7 @@ export default function HomePage() {
     settingsOpen,
     sessions,
     integrationStatus,
+    hydrateFromStorage,
     setControl,
     setMood,
     toggleLock,
@@ -49,6 +50,10 @@ export default function HomePage() {
   } = useLoFiStore();
 
   const audio = useAudioEngine(pattern);
+  const songBars = Math.max(
+    pattern.controls.loopBars,
+    pattern.arrangement.reduce((sum, section) => sum + section.bars, 0),
+  );
 
   const refreshIntegrationStatus = useCallback(async () => {
     try {
@@ -58,6 +63,10 @@ export default function HomePage() {
       // Keep UI operational even if status endpoint fails.
     }
   }, [setIntegrationStatus]);
+
+  useEffect(() => {
+    hydrateFromStorage();
+  }, [hydrateFromStorage]);
 
   useEffect(() => {
     refreshIntegrationStatus();
@@ -172,12 +181,18 @@ export default function HomePage() {
 
             <ExportPanel
               exportBars={controls.exportBars}
+              songBars={songBars}
               arrangement={pattern.arrangement}
               isExporting={audio.isExporting}
               onExportLoop={async () => {
                 const blob = await audio.exportWav(controls.exportBars);
                 if (!blob) return;
                 downloadBlob(blob, buildWavFilename(controls));
+              }}
+              onExportSong={async () => {
+                const blob = await audio.exportWav(songBars);
+                if (!blob) return;
+                downloadBlob(blob, `lofi-foundry-song-${controls.seed}-${songBars}bars.wav`);
               }}
             />
 

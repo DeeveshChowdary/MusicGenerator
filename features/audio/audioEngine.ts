@@ -3,7 +3,9 @@
 import toWav from "audiobuffer-to-wav";
 import * as Tone from "tone";
 
-import type { AmbienceType, ChordEvent, DrumHit, LoopPattern, NoteEvent } from "@/features/generator/types";
+import { scheduleExportDrumHit, type ExportDrumPools } from "@/features/audio/exportScheduler";
+import { buildSongTimeline } from "@/features/audio/songTimeline";
+import type { AmbienceType, ArrangementSection, ChordEvent, DrumHit, LoopPattern, NoteEvent } from "@/features/generator/types";
 
 interface StepMaps {
   drums: Map<number, DrumHit[]>;
@@ -50,6 +52,22 @@ function safeTime(time: number): number {
   return Number.isFinite(time) ? Math.max(0, time) : 0;
 }
 
+type ScheduleVoiceKey = "kick" | "snare" | "hatClosed" | "hatOpen" | "perc" | "bass" | "melody" | "chord";
+
+function monotonicTime(target: number, last: number): number {
+  const t = safeTime(target);
+  if (t > last) return t;
+  return last + 0.001;
+}
+
+function drumVoiceKey(instrument: DrumHit["instrument"]): "kick" | "snare" | "hatClosed" | "hatOpen" | "perc" {
+  if (instrument === "hatClosed") return "hatClosed";
+  if (instrument === "hatOpen") return "hatOpen";
+  if (instrument === "perc") return "perc";
+  if (instrument === "snare") return "snare";
+  return "kick";
+}
+
 export class LoFiAudioEngine {
   private initialized = false;
 
@@ -63,6 +81,25 @@ export class LoFiAudioEngine {
   };
 
   private transportStep = 0;
+
+  private totalSteps = 64;
+
+  private totalBars = 4;
+
+  private sectionByBar: ArrangementSection[] = [];
+
+  private activeSectionName: ArrangementSection["name"] | null = null;
+
+  private liveCursor: Record<ScheduleVoiceKey, number> = {
+    kick: 0,
+    snare: 0,
+    hatClosed: 0,
+    hatOpen: 0,
+    perc: 0,
+    bass: 0,
+    melody: 0,
+    chord: 0,
+  };
 
   private transportEventId: number | null = null;
 
@@ -122,9 +159,17 @@ export class LoFiAudioEngine {
     envelope: { attack: 0.001, decay: 0.16, sustain: 0 },
   });
 
-  private hatSynth = new Tone.MetalSynth({
+  private hatClosedSynth = new Tone.MetalSynth({
     octaves: 1.5,
     envelope: { attack: 0.001, decay: 0.08, release: 0.02 },
+    harmonicity: 5,
+    modulationIndex: 42,
+    resonance: 1700,
+  });
+
+  private hatOpenSynth = new Tone.MetalSynth({
+    octaves: 1.5,
+    envelope: { attack: 0.001, decay: 0.16, release: 0.04 },
     harmonicity: 5,
     modulationIndex: 42,
     resonance: 1700,
@@ -186,7 +231,8 @@ export class LoFiAudioEngine {
 
     this.kickSynth.connect(this.drumsBus);
     this.snareSynth.connect(this.drumsBus);
-    this.hatSynth.connect(this.drumsBus);
+    this.hatClosedSynth.connect(this.drumsBus);
+    this.hatOpenSynth.connect(this.drumsBus);
     this.percSynth.connect(this.drumsBus);
     this.drumSamples.connect(this.drumsBus);
 
@@ -212,15 +258,37 @@ export class LoFiAudioEngine {
       this.transportEventId = null;
     }
     this.transportStep = 0;
+    this.resetLiveCursor();
+  }
+
+  private resetLiveCursor(): void {
+    this.liveCursor = {
+      kick: 0,
+      snare: 0,
+      hatClosed: 0,
+      hatOpen: 0,
+      perc: 0,
+      bass: 0,
+      melody: 0,
+      chord: 0,
+    };
   }
 
   setPattern(pattern: LoopPattern): void {
     this.pattern = pattern;
+    const timeline = buildSongTimeline(pattern);
+
+    this.totalBars = timeline.totalBars;
+    this.totalSteps = timeline.totalSteps;
+    this.sectionByBar = timeline.sectionByBar;
+    this.activeSectionName = null;
+    this.resetLiveCursor();
+
     this.stepMaps = {
-      drums: groupByStep(pattern.drums),
-      chords: groupByStep(pattern.chords.map((chord) => ({ ...chord, step: chord.bar * 16 + Math.round(chord.beat * 4) }))),
-      bass: groupByStep(pattern.bass),
-      melody: groupByStep(pattern.melody),
+      drums: groupByStep(timeline.drums),
+      chords: groupByStep(timeline.chords.map((chord) => ({ ...chord, step: chord.bar * 16 + Math.round(chord.beat * 4) }))),
+      bass: groupByStep(timeline.bass),
+      melody: groupByStep(timeline.melody),
     };
 
     this.applyMixFromPattern();
@@ -233,12 +301,12 @@ export class LoFiAudioEngine {
     Tone.Transport.swingSubdivision = "8n";
     Tone.Transport.loop = true;
     Tone.Transport.loopStart = 0;
-    Tone.Transport.loopEnd = `${pattern.controls.loopBars}m`;
+    Tone.Transport.loopEnd = `${timeline.totalBars}m`;
 
     this.clearSchedule();
     this.transportEventId = Tone.Transport.scheduleRepeat((time) => {
       this.runStep(time);
-      this.transportStep = (this.transportStep + 1) % (pattern.controls.loopBars * 16);
+      this.transportStep = (this.transportStep + 1) % this.totalSteps;
     }, "16n");
   }
 
@@ -278,42 +346,73 @@ export class LoFiAudioEngine {
   private runStep(time: number): void {
     if (!this.pattern) return;
     const step = this.transportStep;
+    const barIndex = Math.floor(step / 16);
+    const section = this.sectionByBar[barIndex];
 
-    const drumHits = this.stepMaps.drums.get(step) ?? [];
+    if (section && section.name !== this.activeSectionName) {
+      this.activeSectionName = section.name;
+      this.applySectionAutomation(section);
+    }
+
+    const drumHits = [...(this.stepMaps.drums.get(step) ?? [])].sort((a, b) => a.offset - b.offset);
     for (const hit of drumHits) {
       if (hit.muted) continue;
-      this.triggerDrum(hit, safeTime(time + hit.offset));
+      const key = drumVoiceKey(hit.instrument);
+      const scheduled = monotonicTime(time + hit.offset, this.liveCursor[key]);
+      this.liveCursor[key] = scheduled;
+      this.triggerDrum(hit, scheduled);
     }
 
     const chordEvents = this.stepMaps.chords.get(step) ?? [];
     for (const chord of chordEvents) {
+      const chordTime = monotonicTime(time, this.liveCursor.chord);
+      this.liveCursor.chord = chordTime;
       this.chordSynth.triggerAttackRelease(
         chord.notes.map((note) => Tone.Frequency(note, "midi").toFrequency()),
         `${chord.durationBeats}n`,
-        time,
+        chordTime,
         0.5,
       );
     }
 
-    const bassEvents = this.stepMaps.bass.get(step) ?? [];
+    const bassEvents = [...(this.stepMaps.bass.get(step) ?? [])].sort((a, b) => a.offset - b.offset);
     for (const note of bassEvents) {
+      const bassTime = monotonicTime(time + note.offset, this.liveCursor.bass);
+      this.liveCursor.bass = bassTime;
       this.bassSynth.triggerAttackRelease(
         Tone.Frequency(note.midi, "midi").toFrequency(),
         Tone.Time(`${Math.max(1, note.durationSteps)}*16n`).toSeconds(),
-        safeTime(time + note.offset),
+        bassTime,
         note.velocity,
       );
     }
 
-    const melodyEvents = this.stepMaps.melody.get(step) ?? [];
+    const melodyEvents = [...(this.stepMaps.melody.get(step) ?? [])].sort((a, b) => a.offset - b.offset);
     for (const note of melodyEvents) {
+      const melodyTime = monotonicTime(time + note.offset, this.liveCursor.melody);
+      this.liveCursor.melody = melodyTime;
       this.melodySynth.triggerAttackRelease(
         Tone.Frequency(note.midi, "midi").toFrequency(),
         Tone.Time(`${Math.max(1, note.durationSteps)}*16n`).toSeconds(),
-        safeTime(time + note.offset),
+        melodyTime,
         note.velocity,
       );
     }
+  }
+
+  private applySectionAutomation(section: ArrangementSection): void {
+    if (!this.pattern) return;
+    const controls = this.pattern.controls;
+
+    const targetLowPass = 1_500 + section.filterCutoff * 13_500 + (1 - controls.lowPassWarmth) * 2_000;
+    const melodyBase = controls.melodyDensity === "none" ? 0 : 0.25;
+
+    this.lowPass.frequency.rampTo(targetLowPass, 0.18);
+    this.drumsBus.gain.rampTo(0.68 + section.hatsDensity * 0.34, 0.18);
+    this.chordsBus.gain.rampTo(0.66 + section.filterCutoff * 0.25, 0.18);
+    this.bassBus.gain.rampTo(0.62 + section.filterCutoff * 0.15, 0.18);
+    this.melodyBus.gain.rampTo(melodyBase + section.melodyPresence * 0.42, 0.18);
+    this.ambienceBus.gain.rampTo(0.18 + section.ambienceIntensity * 0.42 + controls.vinylAmount * 0.08, 0.18);
   }
 
   private triggerDrum(hit: DrumHit, time: number): void {
@@ -336,10 +435,10 @@ export class LoFiAudioEngine {
         this.snareSynth.triggerAttackRelease("16n", time, hit.velocity);
         break;
       case "hatClosed":
-        this.hatSynth.triggerAttackRelease("32n", time, hit.velocity * 0.7);
+        this.hatClosedSynth.triggerAttackRelease("32n", time, hit.velocity * 0.7);
         break;
       case "hatOpen":
-        this.hatSynth.triggerAttackRelease("8n", time, hit.velocity * 0.65);
+        this.hatOpenSynth.triggerAttackRelease("8n", time, hit.velocity * 0.65);
         break;
       case "perc":
         this.percSynth.triggerAttackRelease("C4", "16n", time, hit.velocity * 0.7);
@@ -411,77 +510,118 @@ export class LoFiAudioEngine {
         envelope: { attack: 0.02, decay: 0.2, sustain: 0.2, release: 0.35 },
       }).toDestination();
 
-      const kickSynth = new Tone.MembraneSynth().toDestination();
-      const snareSynth = new Tone.NoiseSynth({ envelope: { attack: 0.001, decay: 0.16, sustain: 0 } }).toDestination();
-      const hatSynth = new Tone.MetalSynth({
-        octaves: 1.5,
-        envelope: { attack: 0.001, decay: 0.08, release: 0.02 },
-        harmonicity: 5,
-        modulationIndex: 42,
-        resonance: 1700,
-      }).toDestination();
-
-      const percSynth = new Tone.Synth({ oscillator: { type: "triangle" } }).toDestination();
-
       const totalSteps = bars * 16;
-      const loopSteps = pattern.controls.loopBars * 16;
+      const timelineSteps = this.totalSteps;
       const stepDuration = Tone.Time("16n").toSeconds();
+
+      const kickVoiceNodes = Array.from({ length: 4 }, () => new Tone.MembraneSynth().toDestination());
+      const snareVoiceNodes = Array.from(
+        { length: 4 },
+        () => new Tone.NoiseSynth({ envelope: { attack: 0.001, decay: 0.16, sustain: 0 } }).toDestination(),
+      );
+      const hatClosedVoiceNodes = Array.from(
+        { length: 8 },
+        () =>
+          new Tone.NoiseSynth({
+            noise: { type: "white" },
+            envelope: { attack: 0.001, decay: 0.05, sustain: 0 },
+          }).toDestination(),
+      );
+      const hatOpenVoiceNodes = Array.from(
+        { length: 6 },
+        () =>
+          new Tone.NoiseSynth({
+            noise: { type: "pink" },
+            envelope: { attack: 0.001, decay: 0.14, sustain: 0 },
+          }).toDestination(),
+      );
+      const percVoiceNodes = Array.from(
+        { length: 4 },
+        () => new Tone.Synth({ oscillator: { type: "triangle" } }).toDestination(),
+      );
+
+      const exportDrumPools: ExportDrumPools = {
+        kick: kickVoiceNodes.map((node) => ({
+          play: (time, velocity) => node.triggerAttackRelease("C1", "8n", time, velocity),
+          availableAt: 0,
+          lastScheduled: 0,
+        })),
+        snare: snareVoiceNodes.map((node) => ({
+          play: (time, velocity) => node.triggerAttackRelease("16n", time, velocity),
+          availableAt: 0,
+          lastScheduled: 0,
+        })),
+        hatClosed: hatClosedVoiceNodes.map((node) => ({
+          play: (time, velocity) => node.triggerAttackRelease("32n", time, velocity * 0.65),
+          availableAt: 0,
+          lastScheduled: 0,
+        })),
+        hatOpen: hatOpenVoiceNodes.map((node) => ({
+          play: (time, velocity) => node.triggerAttackRelease("8n", time, velocity * 0.55),
+          availableAt: 0,
+          lastScheduled: 0,
+        })),
+        perc: percVoiceNodes.map((node) => ({
+          play: (time, velocity) => node.triggerAttackRelease("C4", "16n", time, velocity * 0.6),
+          availableAt: 0,
+          lastScheduled: 0,
+        })),
+      };
+      const exportCursor: Record<ScheduleVoiceKey, number> = {
+        kick: 0,
+        snare: 0,
+        hatClosed: 0,
+        hatOpen: 0,
+        perc: 0,
+        bass: 0,
+        melody: 0,
+        chord: 0,
+      };
 
       for (let step = 0; step < totalSteps; step += 1) {
         const time = step * stepDuration;
-        const localStep = step % loopSteps;
+        const sourceStep = step % timelineSteps;
 
-        const drums = this.stepMaps.drums.get(localStep) ?? [];
+        const drums = [...(this.stepMaps.drums.get(sourceStep) ?? [])].sort((a, b) => a.offset - b.offset);
         drums.forEach((hit) => {
           if (hit.muted) return;
-          const t = safeTime(time + hit.offset);
-          switch (hit.instrument) {
-            case "kick":
-              kickSynth.triggerAttackRelease("C1", "8n", t, hit.velocity);
-              break;
-            case "snare":
-              snareSynth.triggerAttackRelease("16n", t, hit.velocity);
-              break;
-            case "hatClosed":
-              hatSynth.triggerAttackRelease("32n", t, hit.velocity * 0.65);
-              break;
-            case "hatOpen":
-              hatSynth.triggerAttackRelease("8n", t, hit.velocity * 0.55);
-              break;
-            case "perc":
-              percSynth.triggerAttackRelease("C4", "16n", t, hit.velocity * 0.6);
-              break;
-            default:
-              break;
-          }
+          const key = drumVoiceKey(hit.instrument);
+          const t = scheduleExportDrumHit(exportDrumPools, hit, time + hit.offset, stepDuration);
+          exportCursor[key] = t;
         });
 
-        const chords = this.stepMaps.chords.get(localStep) ?? [];
+        const chords = this.stepMaps.chords.get(sourceStep) ?? [];
         chords.forEach((chord) => {
+          const chordTime = monotonicTime(time, exportCursor.chord);
+          exportCursor.chord = chordTime;
           chordSynth.triggerAttackRelease(
             chord.notes.map((n) => Tone.Frequency(n, "midi").toFrequency()),
             `${chord.durationBeats}n`,
-            time,
+            chordTime,
             0.5,
           );
         });
 
-        const bass = this.stepMaps.bass.get(localStep) ?? [];
+        const bass = [...(this.stepMaps.bass.get(sourceStep) ?? [])].sort((a, b) => a.offset - b.offset);
         bass.forEach((note) => {
+          const bassTime = monotonicTime(time + note.offset, exportCursor.bass);
+          exportCursor.bass = bassTime;
           bassSynth.triggerAttackRelease(
             Tone.Frequency(note.midi, "midi").toFrequency(),
             stepDuration * Math.max(1, note.durationSteps),
-            safeTime(time + note.offset),
+            bassTime,
             note.velocity,
           );
         });
 
-        const melody = this.stepMaps.melody.get(localStep) ?? [];
+        const melody = [...(this.stepMaps.melody.get(sourceStep) ?? [])].sort((a, b) => a.offset - b.offset);
         melody.forEach((note) => {
+          const melodyTime = monotonicTime(time + note.offset, exportCursor.melody);
+          exportCursor.melody = melodyTime;
           melodySynth.triggerAttackRelease(
             Tone.Frequency(note.midi, "midi").toFrequency(),
             stepDuration * Math.max(1, note.durationSteps),
-            safeTime(time + note.offset),
+            melodyTime,
             note.velocity,
           );
         });
@@ -506,7 +646,8 @@ export class LoFiAudioEngine {
     this.ambiencePlayer.dispose();
     this.kickSynth.dispose();
     this.snareSynth.dispose();
-    this.hatSynth.dispose();
+    this.hatClosedSynth.dispose();
+    this.hatOpenSynth.dispose();
     this.percSynth.dispose();
     this.chordSynth.dispose();
     this.bassSynth.dispose();

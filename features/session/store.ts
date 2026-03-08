@@ -26,11 +26,13 @@ interface LoFiState {
   controls: GeneratorControls;
   locks: LayerLocks;
   pattern: LoopPattern;
+  hasHydratedFromStorage: boolean;
   isPlaying: boolean;
   audioReady: boolean;
   settingsOpen: boolean;
   sessions: SavedSession[];
   integrationStatus: IntegrationStatus;
+  hydrateFromStorage: () => void;
   setAudioReady: (ready: boolean) => void;
   setIsPlaying: (playing: boolean) => void;
   setControl: <K extends keyof GeneratorControls>(key: K, value: GeneratorControls[K]) => void;
@@ -64,26 +66,16 @@ function clampBpm(bpm: number): number {
   return Math.max(56, Math.min(108, bpm));
 }
 
-function rehydratePattern(): LoopPattern {
-  const stored = readLastSession();
-  return stored ?? initialPattern;
-}
-
-function rehydrateSessions(): SavedSession[] {
-  return readSessions();
-}
-
 export const useLoFiStore = create<LoFiState>((set, get) => {
-  const hydratedPattern = rehydratePattern();
-
   return {
-    controls: hydratedPattern.controls ?? DEFAULT_CONTROLS,
+    controls: initialPattern.controls ?? DEFAULT_CONTROLS,
     locks: DEFAULT_LOCKS,
-    pattern: hydratedPattern,
+    pattern: initialPattern,
+    hasHydratedFromStorage: false,
     isPlaying: false,
     audioReady: false,
     settingsOpen: false,
-    sessions: rehydrateSessions(),
+    sessions: [],
     integrationStatus: {
       freesoundConfigured: false,
       pixabayConfigured: false,
@@ -91,6 +83,21 @@ export const useLoFiStore = create<LoFiState>((set, get) => {
       pixabayReachable: false,
     },
 
+    hydrateFromStorage: () => {
+      if (get().hasHydratedFromStorage) return;
+      const storedPattern = readLastSession();
+      const storedSessions = readSessions();
+      if (storedPattern) {
+        set({
+          pattern: storedPattern,
+          controls: storedPattern.controls,
+          sessions: storedSessions,
+          hasHydratedFromStorage: true,
+        });
+        return;
+      }
+      set({ sessions: storedSessions, hasHydratedFromStorage: true });
+    },
     setAudioReady: (audioReady) => set({ audioReady }),
     setIsPlaying: (isPlaying) => set({ isPlaying }),
     setControl: (key, value) => {
