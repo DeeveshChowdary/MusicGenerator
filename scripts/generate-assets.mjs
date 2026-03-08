@@ -1,0 +1,168 @@
+import fs from "node:fs";
+import path from "node:path";
+
+const sampleRate = 44100;
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeWav(filePath, data, channels = 1, rate = sampleRate) {
+  const bytesPerSample = 2;
+  const blockAlign = channels * bytesPerSample;
+  const byteRate = rate * blockAlign;
+  const dataSize = data.length * bytesPerSample;
+  const buffer = Buffer.alloc(44 + dataSize);
+
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(rate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataSize, 40);
+
+  for (let i = 0; i < data.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, data[i]));
+    buffer.writeInt16LE(Math.floor(sample * 32767), 44 + i * 2);
+  }
+
+  fs.writeFileSync(filePath, buffer);
+}
+
+function envelope(t, attack, decay) {
+  if (t < attack) {
+    return t / attack;
+  }
+  return Math.exp(-decay * (t - attack));
+}
+
+function createKick(duration = 0.5) {
+  const length = Math.floor(duration * sampleRate);
+  const data = new Float32Array(length);
+  for (let i = 0; i < length; i += 1) {
+    const t = i / sampleRate;
+    const freq = 120 - t * 90;
+    const env = envelope(t, 0.002, 12);
+    data[i] = Math.sin(2 * Math.PI * freq * t) * env;
+  }
+  return data;
+}
+
+function createSnare(duration = 0.35) {
+  const length = Math.floor(duration * sampleRate);
+  const data = new Float32Array(length);
+  for (let i = 0; i < length; i += 1) {
+    const t = i / sampleRate;
+    const tone = Math.sin(2 * Math.PI * 220 * t) * 0.22;
+    const noise = (Math.random() * 2 - 1) * 0.78;
+    const env = envelope(t, 0.001, 18);
+    data[i] = (tone + noise) * env;
+  }
+  return data;
+}
+
+function createHat(duration = 0.18, open = false) {
+  const length = Math.floor(duration * sampleRate);
+  const data = new Float32Array(length);
+  const decay = open ? 24 : 48;
+  for (let i = 0; i < length; i += 1) {
+    const t = i / sampleRate;
+    const noise = (Math.random() * 2 - 1) * 0.9;
+    const hp = noise - (i > 0 ? data[i - 1] * 0.91 : 0);
+    const env = envelope(t, 0.0005, decay);
+    data[i] = hp * env * 0.6;
+  }
+  return data;
+}
+
+function createPerc(duration = 0.24) {
+  const length = Math.floor(duration * sampleRate);
+  const data = new Float32Array(length);
+  for (let i = 0; i < length; i += 1) {
+    const t = i / sampleRate;
+    const tone = Math.sin(2 * Math.PI * (420 + Math.sin(t * 50) * 20) * t);
+    const env = envelope(t, 0.0008, 30);
+    data[i] = tone * env * 0.45;
+  }
+  return data;
+}
+
+function createAmbience(duration = 8, mode = "vinyl") {
+  const length = Math.floor(duration * sampleRate);
+  const data = new Float32Array(length);
+  let lp = 0;
+
+  for (let i = 0; i < length; i += 1) {
+    const t = i / sampleRate;
+    const white = Math.random() * 2 - 1;
+    const brown = (i > 0 ? data[i - 1] * 0.98 : 0) + white * 0.03;
+    const low = (lp = lp * 0.97 + white * 0.03);
+
+    if (mode === "vinyl") {
+      const crackle = Math.random() > 0.997 ? (Math.random() * 2 - 1) * 0.6 : 0;
+      data[i] = low * 0.14 + crackle;
+    } else if (mode === "rain") {
+      const drops = Math.random() > 0.992 ? (Math.random() * 2 - 1) * 0.24 : 0;
+      data[i] = brown * 0.28 + drops;
+    } else if (mode === "cafe") {
+      const chatter = Math.sin(2 * Math.PI * 180 * t) * 0.02 + Math.sin(2 * Math.PI * 260 * t) * 0.02;
+      data[i] = brown * 0.15 + chatter;
+    } else if (mode === "city") {
+      const hum = Math.sin(2 * Math.PI * 90 * t) * 0.05;
+      data[i] = brown * 0.2 + hum;
+    } else {
+      data[i] = low * 0.12;
+    }
+  }
+
+  return data;
+}
+
+const root = path.resolve(process.cwd(), "public/assets");
+const sampleDir = path.join(root, "samples");
+const ambienceDir = path.join(root, "ambience");
+const metadataDir = path.join(root, "metadata");
+
+ensureDir(sampleDir);
+ensureDir(ambienceDir);
+ensureDir(metadataDir);
+
+writeWav(path.join(sampleDir, "kick.wav"), createKick());
+writeWav(path.join(sampleDir, "snare.wav"), createSnare());
+writeWav(path.join(sampleDir, "hat_closed.wav"), createHat(0.12, false));
+writeWav(path.join(sampleDir, "hat_open.wav"), createHat(0.28, true));
+writeWav(path.join(sampleDir, "perc.wav"), createPerc());
+
+writeWav(path.join(ambienceDir, "vinyl.wav"), createAmbience(10, "vinyl"));
+writeWav(path.join(ambienceDir, "rain.wav"), createAmbience(10, "rain"));
+writeWav(path.join(ambienceDir, "cafe.wav"), createAmbience(10, "cafe"));
+writeWav(path.join(ambienceDir, "night_city.wav"), createAmbience(10, "city"));
+writeWav(path.join(ambienceDir, "room.wav"), createAmbience(10, "room"));
+
+const manifest = {
+  generatedAt: new Date().toISOString(),
+  license: "MIT",
+  source: "Procedurally generated by scripts/generate-assets.mjs inside this repository.",
+  files: [
+    "samples/kick.wav",
+    "samples/snare.wav",
+    "samples/hat_closed.wav",
+    "samples/hat_open.wav",
+    "samples/perc.wav",
+    "ambience/vinyl.wav",
+    "ambience/rain.wav",
+    "ambience/cafe.wav",
+    "ambience/night_city.wav",
+    "ambience/room.wav",
+  ],
+};
+
+fs.writeFileSync(path.join(metadataDir, "asset-manifest.json"), JSON.stringify(manifest, null, 2));
+console.log("Generated local audio assets.");
